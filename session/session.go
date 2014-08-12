@@ -1,34 +1,104 @@
 package session
 
 import (
+	"fmt"
+	redis "ha-redis/vendor/github.com/fzzy/radix/redis"
 	"log"
 	"net"
+	"os"
+	"strconv"
 	"time"
 )
 
-var connPool ConnPool
+var connPool *ConnPool
+var redisConn net.Conn
 
-func initialize() {
+func init() {
 
 	// we connect to redis sentinel
 
-	// we get the list of masters and slaves for "default"
-
-	// we connect to the master and to each of the slaves (ConnWrapper)
-
 	var err error
+	//var sentinelHost = "127.0.0.1"
+	var sentinelHost = "10.10.10.10"
+	var sentinelPort = 26379
 
-	redisConn, err = net.Dial("tcp", "10.10.10.10:6381")
-	if err != nil {
-		log.Fatalf("Unable to connect to redis %v", err)
+	if len(os.Args) > 1 {
+		sentinelHost = os.Args[1]
 	}
+
+	if len(os.Args) > 2 {
+		sentinelPort, err = strconv.Atoi(os.Args[2])
+
+		if err != nil {
+			sentinelPort = 26379
+		}
+	}
+
+	sentinel, err := redis.DialTimeout("tcp", fmt.Sprintf("%s:%d", sentinelHost, sentinelPort), time.Duration(10)*time.Second)
+
+	if err != nil {
+		log.Fatalf("Unable to connect to sentinel %s:%d => %v", sentinelHost, sentinelPort, err)
+	}
+
+	r := sentinel.Cmd("sentinel", "masters")
+
+	if r.Err != nil {
+		log.Fatalf("Sentinel masters call failed %v", r.Err)
+	}
+
+	if len(r.Elems) == 0 {
+		log.Fatalf("Sentinel reported no masters", r.Err)
+	}
+
+	// we pick the first
+	r = r.Elems[0]
+
+	masterInfo, err := r.Hash()
+
+	if err != nil {
+		log.Fatalf("Malformed Sentinel masters reply", err)
+	}
+
+	masterHost := masterInfo["ip"]
+	masterPort, _ := strconv.Atoi(masterInfo["port"])
+
+	// we connect to the master
+	masterConn := NewConnWrapper(masterHost, masterPort)
+
+	masterName := masterInfo["name"]
+
+	// we get the slaves
+	r = sentinel.Cmd("sentinel", "slaves", masterName)
+
+	if len(r.Elems) == 0 {
+		log.Fatalf("Sentinel reported no slaves for %s", masterName, r.Err)
+	}
+
+	slaveConnList := make([]*ConnWrapper, 0)
+
+	for index, slaveReply := range r.Elems {
+
+		slaveInfo, err := slaveReply.Hash()
+
+		if err != nil {
+			log.Fatalf("Malformed Sentinel slaves reply", err)
+		}
+
+		slaveHost := slaveInfo["ip"]
+		slavePort, _ := strconv.Atoi(slaveInfo["port"])
+
+		slaveConnList = append(slaveConnList, NewConnWrapper(slaveHost, slavePort))
+
+		log.Printf("Analyzing slave #%d => %s:%d", index, slaveHost, slavePort)
+	}
+
+	// the pool is ready
+	connPool = NewConnPool(masterConn, slaveConnList)
+
+	log.Printf("The pool is ready: 1 master and %d slaves\n", len(slaveConnList))
 }
 
 func NewCommandSession(client net.Conn) *CommandSession {
-
-	if redisConn == nil {
-		initialize()
-	}
 
 	// TODO for now we return one connection only
 	return &CommandSession{client: client, redis: redisConn}
@@ -41,7 +111,7 @@ type CommandSession struct {
 
 func (c *CommandSession) SendAndReceive(src []byte) {
 
-	// we write to redis
+	// we write to the redis conn
 	writtenSoFar := 0
 
 	for writtenSoFar < len(src) {

@@ -1,47 +1,63 @@
 package session
 
 import (
-	"fmt"
-	"log"
-	"net"
+	"math/rand"
+	"sync"
 )
 
 type ConnPool struct {
 	masterConn    *ConnWrapper
-	slaveConnList []ConnWrapper
+	masterLock    *sync.Mutex
+	slaveConnList []*ConnWrapper
+	slaveListLock *sync.Mutex
 }
 
-func (c *ConnPool) SetMaster(host string, port int) {
-
-	if c.masterConn != nil {
-		c.masterConn.Destroy()
-	}
-
-	c.masterConn = NewConnWrapper(host, port)
+func NewConnPool(master *ConnWrapper, slaveList []*ConnWrapper) *ConnPool {
+	return &ConnPool{masterConn: master, slaveConnList: slaveList}
 }
 
-func (c *ConnPool) AddSlave(host string, port int) {
-	if c.slaveConnList == nil {
-		c.slaveConnList = make([]ConnWrapper, 0)
+func (c *ConnPool) GetSlave() *ConnWrapper {
+
+	c.slaveListLock.Lock()
+	defer c.slaveListLock.Unlock()
+
+	if len(c.slaveConnList) == 0 {
+		return nil
 	}
 
-	c.slaveConnList = append(c.slaveConnList, *NewConnWrapper(host, port))
+	randIndex := rand.Intn(len(c.slaveConnList))
+	ret := c.slaveConnList[randIndex]
+
+	c.slaveConnList = append(c.slaveConnList[:randIndex], c.slaveConnList[randIndex+1:]...)
+
+	return ret
 }
 
-func (c *ConnPool) RemoveSlave(host string, port int) {
+func (c *ConnPool) ReturnSlave(conn *ConnWrapper) {
 
-	newSlaveConnList := make([]ConnWrapper, 0)
+	c.slaveListLock.Lock()
+	defer c.slaveListLock.Unlock()
 
-	for _, connWrapper := range c.slaveConnList {
-		if connWrapper.Host() == host && connWrapper.Port() == port {
+	c.slaveConnList = append(c.slaveConnList, conn)
+}
 
-			// we destroy the connection
-			connWrapper.Destroy()
+func (c *ConnPool) GetMaster() *ConnWrapper {
 
-		} else {
-			newSlaveConnList = append(newSlaveConnList, connWrapper)
-		}
+	c.masterLock.Lock()
+	defer c.masterLock.Unlock()
+
+	ret := c.masterConn
+
+	c.masterConn = nil
+	return ret
+}
+
+func (c *ConnPool) ReturnMaster(conn *ConnWrapper) {
+
+	c.masterLock.Lock()
+	defer c.masterLock.Unlock()
+
+	if c.masterConn == nil {
+		c.masterConn = conn
 	}
-
-	c.slaveConnList = newSlaveConnList
 }
