@@ -4,17 +4,17 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 )
 
 type ConnWrapper struct {
-	host      string
-	port      int
+	hostPort  string
 	redisConn net.Conn
 	connected bool
 }
 
-func NewConnWrapper(host string, port int) *ConnWrapper {
-	return &ConnWrapper{host: host, port: port, connected: false}
+func NewConnWrapper(hostPort string) *ConnWrapper {
+	return &ConnWrapper{hostPort: hostPort, connected: false}
 }
 
 func (c *ConnWrapper) connect() error {
@@ -26,13 +26,13 @@ func (c *ConnWrapper) connect() error {
 		c.redisConn.Close()
 	}
 
-	c.redisConn, err = net.Dial("tcp", fmt.Sprintf("%s:%d", c.host, c.port))
+	c.redisConn, err = net.Dial("tcp", c.hostPort)
 	if err != nil {
-		return fmt.Errorf("ConnWrapper: Unable to connect to %s:%d because %v", c.host, c.port, err)
+		return fmt.Errorf("ConnWrapper: Unable to connect to '%s' because %v", c.hostPort, err)
 	}
 	c.connected = true
 
-	log.Printf("ConnWrapper: connected to %s:%d", c.host, c.port)
+	log.Printf("ConnWrapper: connected to %s", c.hostPort)
 
 	return nil
 }
@@ -56,6 +56,32 @@ func (c *ConnWrapper) Read(b []byte) (n int, err error) {
 	return
 }
 
+func (c *ConnWrapper) SetWriteDeadline(deadline time.Time) error {
+
+	if !c.connected {
+		err := c.connect()
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return c.redisConn.SetWriteDeadline(deadline)
+}
+
+func (c *ConnWrapper) SetReadDeadline(deadline time.Time) error {
+
+	if !c.connected {
+		err := c.connect()
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return c.redisConn.SetReadDeadline(deadline)
+}
+
 func (c *ConnWrapper) Write(b []byte) (n int, err error) {
 
 	if !c.connected {
@@ -75,12 +101,8 @@ func (c *ConnWrapper) Write(b []byte) (n int, err error) {
 	return
 }
 
-func (c *ConnWrapper) Host() string {
-	return c.host
-}
-
-func (c *ConnWrapper) Port() int {
-	return c.port
+func (c *ConnWrapper) HostPort() string {
+	return c.hostPort
 }
 
 func (c *ConnWrapper) IsConnected() bool {

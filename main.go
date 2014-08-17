@@ -2,20 +2,19 @@ package main
 
 import (
 	"fmt"
-	//"ha-redis/vendor/github.com/fzzy/radix/redis"
+	"hargo/session"
 	"log"
 	"net"
-	//"os"
-	//"time"
-	"ha-redis/session"
 	"strconv"
 	"strings"
 )
 
+//const readCommandList
+
 func main() {
 
 	// we start a tcp server on port 36379
-	ln, err := net.Listen("tcp", "127.0.0.1:36379")
+	ln, err := net.Listen("tcp", ":36379")
 	if err != nil {
 		log.Fatalf("Unable to listen on port 36379 because: %v", err)
 	}
@@ -57,7 +56,7 @@ func handleConnection(conn net.Conn) {
 		log.Printf("We got: '%s'", strings.Join(strList, " / "))
 
 		// we run this session in another goroutine
-		go session.NewCommandSession(conn).SendAndReceive(buffer[0:read])
+		go session.NewHACommandSession(conn).SendAndReceive(buffer[0:read])
 	}
 
 }

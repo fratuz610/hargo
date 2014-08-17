@@ -2,7 +2,7 @@ package session
 
 import (
 	"fmt"
-	redis "ha-redis/vendor/github.com/fzzy/radix/redis"
+	redis "hargo/vendor/github.com/fzzy/radix/redis"
 	"log"
 	"net"
 	"os"
@@ -18,8 +18,7 @@ func init() {
 	// we connect to redis sentinel
 
 	var err error
-	//var sentinelHost = "127.0.0.1"
-	var sentinelHost = "10.10.10.10"
+	var sentinelHost = "127.0.0.1"
 	var sentinelPort = 26379
 
 	if len(os.Args) > 1 {
@@ -59,19 +58,18 @@ func init() {
 		log.Fatalf("Malformed Sentinel masters reply", err)
 	}
 
-	masterHost := masterInfo["ip"]
-	masterPort, _ := strconv.Atoi(masterInfo["port"])
+	masterHostPort := fmt.Sprintf("%s:%s", masterInfo["ip"], masterInfo["port"])
+
+	log.Printf("Got master: %s -> name %s", masterHostPort, masterInfo["name"])
 
 	// we connect to the master
-	masterConn := NewConnWrapper(masterHost, masterPort)
-
-	masterName := masterInfo["name"]
+	masterConn := NewConnWrapper(masterHostPort)
 
 	// we get the slaves
-	r = sentinel.Cmd("sentinel", "slaves", masterName)
+	r = sentinel.Cmd("sentinel", "slaves", masterInfo["name"])
 
 	if len(r.Elems) == 0 {
-		log.Fatalf("Sentinel reported no slaves for %s", masterName, r.Err)
+		log.Fatalf("Sentinel reported no slaves for %s", masterInfo["name"], r.Err)
 	}
 
 	slaveConnList := make([]*ConnWrapper, 0)
@@ -84,12 +82,11 @@ func init() {
 			log.Fatalf("Malformed Sentinel slaves reply", err)
 		}
 
-		slaveHost := slaveInfo["ip"]
-		slavePort, _ := strconv.Atoi(slaveInfo["port"])
+		slaveHostPort := fmt.Sprintf("%s:%s", slaveInfo["ip"], slaveInfo["port"])
 
-		slaveConnList = append(slaveConnList, NewConnWrapper(slaveHost, slavePort))
+		slaveConnList = append(slaveConnList, NewConnWrapper(slaveHostPort))
 
-		log.Printf("Analyzing slave #%d => %s:%d", index, slaveHost, slavePort)
+		log.Printf("Analyzing slave #%d => %s", index, slaveHostPort)
 	}
 
 	// the pool is ready
@@ -99,17 +96,35 @@ func init() {
 }
 
 func NewCommandSession(client net.Conn) *CommandSession {
+	return &CommandSession{client: client, isHA: false}
+}
 
-	// TODO for now we return one connection only
-	return &CommandSession{client: client, redis: redisConn}
+func NewHACommandSession(client net.Conn) *CommandSession {
+	return &CommandSession{client: client, isHA: true}
 }
 
 type CommandSession struct {
 	client net.Conn
-	redis  net.Conn
+	isHA   bool
 }
 
 func (c *CommandSession) SendAndReceive(src []byte) {
+
+	var redis *ConnWrapper
+
+	if c.isHA {
+		redis = connPool.GetMaster()
+	} else {
+		redis = connPool.GetSlave()
+	}
+
+	defer func(redis *ConnWrapper) {
+		if c.isHA {
+			connPool.ReturnMaster(redis)
+		} else {
+			connPool.ReturnSlave(redis)
+		}
+	}(redis)
 
 	// we write to the redis conn
 	writtenSoFar := 0
@@ -117,9 +132,9 @@ func (c *CommandSession) SendAndReceive(src []byte) {
 	for writtenSoFar < len(src) {
 
 		// we time out after 10 seconds
-		c.redis.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		redis.SetWriteDeadline(time.Now().Add(10 * time.Second))
 
-		written, err := c.redis.Write(src)
+		written, err := redis.Write(src)
 
 		if err != nil {
 			log.Printf("Unable to send commmand to redis because: %v", err)
@@ -139,9 +154,9 @@ func (c *CommandSession) SendAndReceive(src []byte) {
 	for {
 
 		// we time out after 5 seconds
-		c.redis.SetReadDeadline(time.Now().Add(5 * time.Second))
+		redis.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-		read, err := c.redis.Read(readBuf)
+		read, err := redis.Read(readBuf)
 
 		if err != nil {
 			log.Printf("Unable to read response from redis because: %v", err)
@@ -180,13 +195,13 @@ func fastParse(src []byte, cnt int) int {
 
 			length := int(0)
 
-			// we read the number of items in the array (which should arrive in one go)
-			for j := 0; src[i+j] != '\r'; j++ {
+			j := 1
+			for j = 1; src[i+j] != '\r'; j++ {
 				length = length*10 + int(src[i+j]-'0')
 			}
 
-			// we skip the final '\n'
-			i++
+			// we skip the final '\n' + the length of the bulk number string
+			i += j + 1
 
 			// we increment the counter for each item in the array
 			cnt += length
@@ -196,20 +211,26 @@ func fastParse(src []byte, cnt int) int {
 			length := int(0)
 
 			// we read the number of items in the array (which should arrive in one go)
-			for j := 0; src[i+j] != '\r'; j++ {
+			j := 1
+			for j = 1; src[i+j] != '\r'; j++ {
 				length = length*10 + int(src[i+j]-'0')
+				log.Printf("j: %d / src[i+j]: '%c' length: %d\n", j, src[i+j], length)
 			}
-			// we skip the final '\n'
-			i++
+
+			// we skip the final '\n' + the length of the bulk number string
+			i += j + 1
 
 			// we skip the bulk string
 			i += length
 
 		case '+', '-', ':': // string, error or number
+
 			cnt++
 		case '\r':
+
 			if i+1 < len(src) && src[i+1] == '\n' {
 				cnt--
+				i++
 			}
 		default:
 			// do nothing

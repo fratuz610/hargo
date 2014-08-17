@@ -7,9 +7,9 @@ import (
 
 type ConnPool struct {
 	masterConn    *ConnWrapper
-	masterLock    *sync.Mutex
+	masterLock    sync.Mutex
 	slaveConnList []*ConnWrapper
-	slaveListLock *sync.Mutex
+	slaveListLock sync.Mutex
 }
 
 func NewConnPool(master *ConnWrapper, slaveList []*ConnWrapper) *ConnPool {
