@@ -1,8 +1,8 @@
-package session
+package discovery
 
 import (
 	"fmt"
-	"log"
+	//"log"
 	"net"
 	"time"
 )
@@ -11,10 +11,13 @@ type ConnWrapper struct {
 	hostPort  string
 	redisConn net.Conn
 	connected bool
+	signature string
 }
 
-func NewConnWrapper(hostPort string) *ConnWrapper {
-	return &ConnWrapper{hostPort: hostPort, connected: false}
+func NewConnWrapper(hostPort, signature string) *ConnWrapper {
+	ret := &ConnWrapper{hostPort: hostPort, connected: false, signature: signature}
+	ret.connect()
+	return ret
 }
 
 func (c *ConnWrapper) connect() error {
@@ -32,7 +35,7 @@ func (c *ConnWrapper) connect() error {
 	}
 	c.connected = true
 
-	log.Printf("ConnWrapper: connected to %s", c.hostPort)
+	//log.Printf("ConnWrapper: connected to %s", c.hostPort)
 
 	return nil
 }
@@ -99,6 +102,10 @@ func (c *ConnWrapper) Write(b []byte) (n int, err error) {
 	}
 
 	return
+}
+
+func (c *ConnWrapper) Signature() string {
+	return c.signature
 }
 
 func (c *ConnWrapper) HostPort() string {

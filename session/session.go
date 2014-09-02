@@ -1,128 +1,121 @@
 package session
 
 import (
-	"fmt"
-	redis "hargo/vendor/github.com/fzzy/radix/redis"
+	"bytes"
+	"hargo/discovery"
 	"log"
 	"net"
-	"os"
-	"strconv"
+	"strings"
 	"time"
 )
 
-var connPool *ConnPool
-var redisConn net.Conn
+var slaveSafeCommandMap map[string]bool
+
+var discov *discovery.Discovery
+var cache *Cache
 
 func init() {
 
-	// we connect to redis sentinel
-
-	var err error
-	var sentinelHost = "127.0.0.1"
-	var sentinelPort = 26379
-
-	if len(os.Args) > 1 {
-		sentinelHost = os.Args[1]
+	slaveSafeCommandMap = map[string]bool{
+		"get":      true,
+		"lrange":   true,
+		"smembers": true,
+		"hgetall":  true,
 	}
 
-	if len(os.Args) > 2 {
-		sentinelPort, err = strconv.Atoi(os.Args[2])
+	// we create the discovery object
+	discov = discovery.NewDiscovery()
+	cache = NewCache()
 
-		if err != nil {
-			sentinelPort = 26379
-		}
-	}
-
-	sentinel, err := redis.DialTimeout("tcp", fmt.Sprintf("%s:%d", sentinelHost, sentinelPort), time.Duration(10)*time.Second)
-
-	if err != nil {
-		log.Fatalf("Unable to connect to sentinel %s:%d => %v", sentinelHost, sentinelPort, err)
-	}
-
-	r := sentinel.Cmd("sentinel", "masters")
-
-	if r.Err != nil {
-		log.Fatalf("Sentinel masters call failed %v", r.Err)
-	}
-
-	if len(r.Elems) == 0 {
-		log.Fatalf("Sentinel reported no masters", r.Err)
-	}
-
-	// we pick the first
-	r = r.Elems[0]
-
-	masterInfo, err := r.Hash()
-
-	if err != nil {
-		log.Fatalf("Malformed Sentinel masters reply", err)
-	}
-
-	masterHostPort := fmt.Sprintf("%s:%s", masterInfo["ip"], masterInfo["port"])
-
-	log.Printf("Got master: %s -> name %s", masterHostPort, masterInfo["name"])
-
-	// we connect to the master
-	masterConn := NewConnWrapper(masterHostPort)
-
-	// we get the slaves
-	r = sentinel.Cmd("sentinel", "slaves", masterInfo["name"])
-
-	if len(r.Elems) == 0 {
-		log.Fatalf("Sentinel reported no slaves for %s", masterInfo["name"], r.Err)
-	}
-
-	slaveConnList := make([]*ConnWrapper, 0)
-
-	for index, slaveReply := range r.Elems {
-
-		slaveInfo, err := slaveReply.Hash()
-
-		if err != nil {
-			log.Fatalf("Malformed Sentinel slaves reply", err)
-		}
-
-		slaveHostPort := fmt.Sprintf("%s:%s", slaveInfo["ip"], slaveInfo["port"])
-
-		slaveConnList = append(slaveConnList, NewConnWrapper(slaveHostPort))
-
-		log.Printf("Analyzing slave #%d => %s", index, slaveHostPort)
-	}
-
-	// the pool is ready
-	connPool = NewConnPool(masterConn, slaveConnList)
-
-	log.Printf("The pool is ready: 1 master and %d slaves\n", len(slaveConnList))
 }
 
 func NewCommandSession(client net.Conn) *CommandSession {
-	return &CommandSession{client: client, isHA: false}
-}
-
-func NewHACommandSession(client net.Conn) *CommandSession {
-	return &CommandSession{client: client, isHA: true}
+	return &CommandSession{client: client, isHA: true, readBuf: make([]byte, 4096)}
 }
 
 type CommandSession struct {
-	client net.Conn
-	isHA   bool
+	client  net.Conn
+	isHA    bool
+	readBuf []byte
 }
 
-func (c *CommandSession) SendAndReceive(src []byte) {
+func (c *CommandSession) Handle() {
 
-	var redis *ConnWrapper
+	for {
 
-	if c.isHA {
-		redis = connPool.GetMaster()
-	} else {
-		redis = connPool.GetSlave()
+		//log.Printf("readBuf: len %d, cap %d\n", len(readBuf), cap(readBuf))
+
+		read, err := c.client.Read(c.readBuf)
+
+		if err != nil {
+			//log.Printf("handleConnection: read error: %v", err)
+			break
+		}
+
+		//log.Printf("Incoming: '%s'\n", string(c.readBuf[0:read]))
+
+		commandList, err := readRequest(c.readBuf[0:read])
+
+		if err != nil {
+			log.Printf("Unable to read command because: %v", err)
+			break
+		}
+
+		//log.Printf("We got: '%s'", strings.Join(strList, " / "))
+
+		if _, ok := slaveSafeCommandMap[strings.ToLower(commandList[0])]; ok {
+			c.isHA = false
+		} else {
+			c.isHA = true
+		}
+
+		c.sendAndReceive(c.readBuf[0:read])
+	}
+}
+
+func (c *CommandSession) sendAndReceive(src []byte) {
+
+	var redis *discovery.ConnWrapper
+	var command string = string(src) // requests are generally very small
+
+	if bufferedResp := cache.Get(command); bufferedResp != nil {
+
+		//log.Printf("Serving cache reply for '%s'\n", command)
+
+		var servedSoFar = 0
+
+		for servedSoFar < len(bufferedResp) {
+
+			// we time out after 5 seconds (client side)
+			c.client.SetWriteDeadline(time.Now().Add(5 * time.Second))
+
+			// we write back to the client
+			written, err := c.client.Write(bufferedResp[servedSoFar:])
+
+			servedSoFar += written
+
+			if err != nil {
+				log.Printf("Unable to write response to the client because: %v", err)
+				c.client.Close()
+				break
+			}
+		}
+
+		// we've served a cached reply
+		return
 	}
 
-	defer func(redis *ConnWrapper) {
+	if c.isHA {
+		redis = discov.GetMaster()
+	} else {
+		redis = discov.GetSlave()
+	}
+
+	defer func(redis *discovery.ConnWrapper) {
 		if c.isHA {
-			connPool.ReturnMaster(redis)
+			discov.ReturnMaster(redis)
 		} else {
-			connPool.ReturnSlave(redis)
+			discov.ReturnSlave(redis)
 		}
 	}(redis)
 
@@ -133,6 +126,8 @@ func (c *CommandSession) SendAndReceive(src []byte) {
 
 		// we time out after 10 seconds
 		redis.SetWriteDeadline(time.Now().Add(10 * time.Second))
+
+		//log.Printf("Sending '%s'\n", string(src))
 
 		written, err := redis.Write(src)
 
@@ -145,32 +140,40 @@ func (c *CommandSession) SendAndReceive(src []byte) {
 		writtenSoFar += written
 	}
 
-	// we read from redis and write straight back to the client
-	readBuf := make([]byte, 4096)
+	//log.Printf("readBuf2: len %d, cap %d\n", len(readBuf), cap(readBuf))
 
 	// we reinit the counter (0 = message complete)
 	cnt := 0
+
+	// we allocate a buffer for the reply
+	respBuffer := &bytes.Buffer{}
+	respBuffer.Grow(4096) // at least 4kb
 
 	for {
 
 		// we time out after 5 seconds
 		redis.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-		read, err := redis.Read(readBuf)
+		read, err := redis.Read(c.readBuf)
 
 		if err != nil {
 			log.Printf("Unable to read response from redis because: %v", err)
 			return
 		}
 
+		//log.Printf("Redis reply: '%s'", strings.Trim(string(c.readBuf[0:read]), "\n\r"))
+
 		// we fast parse the message to see if it's complete
-		cnt = fastParse(readBuf[0:read], cnt)
+		cnt = fastParse(c.readBuf[0:read], cnt)
 
 		// we time out after 5 seconds (client side)
 		c.client.SetWriteDeadline(time.Now().Add(5 * time.Second))
 
+		// we save to the buffer
+		respBuffer.Write(c.readBuf[0:read])
+
 		// we write back to the client
-		_, err = c.client.Write(readBuf[0:read])
+		_, err = c.client.Write(c.readBuf[0:read])
 
 		if err != nil {
 			log.Printf("Unable to write response to the client because: %v", err)
@@ -180,10 +183,17 @@ func (c *CommandSession) SendAndReceive(src []byte) {
 
 		// the message was served complete (no need to read again)
 		if cnt == 0 {
+
 			break
+		} else {
+			log.Printf("Partial reply: cnt %d => '%s'", cnt, string(c.readBuf[0:read]))
 		}
 	}
 
+	// we cache the reply if it's not HA
+	if !c.isHA {
+		cache.Put(command, respBuffer.Bytes())
+	}
 }
 
 func fastParse(src []byte, cnt int) int {
@@ -208,13 +218,20 @@ func fastParse(src []byte, cnt int) int {
 
 		case '$': // bulk string
 
+			// nil bulk string
+			if src[i+1] == '-' && src[i+2] == '1' {
+				i += 2
+				cnt++
+				continue
+			}
+
 			length := int(0)
 
 			// we read the number of items in the array (which should arrive in one go)
 			j := 1
 			for j = 1; src[i+j] != '\r'; j++ {
 				length = length*10 + int(src[i+j]-'0')
-				log.Printf("j: %d / src[i+j]: '%c' length: %d\n", j, src[i+j], length)
+				//log.Printf("j: %d / src[i+j]: '%c' length: %d\n", j, src[i+j], length)
 			}
 
 			// we skip the final '\n' + the length of the bulk number string
@@ -223,7 +240,13 @@ func fastParse(src []byte, cnt int) int {
 			// we skip the bulk string
 			i += length
 
-		case '+', '-', ':': // string, error or number
+			cnt++
+
+		case '-':
+			log.Printf("Error returned!")
+
+			cnt++
+		case '+', ':': // string, error or number
 
 			cnt++
 		case '\r':
