@@ -8,8 +8,6 @@ import (
 	"runtime"
 )
 
-//const readCommandList
-
 func main() {
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
