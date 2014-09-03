@@ -56,7 +56,15 @@ func NewDiscovery() *Discovery {
 	d.masterCh = make(chan *ConnWrapper, conPerEndpoint)
 	d.slavesCh = make(chan *ConnWrapper, conPerEndpoint*3) // max 3 slaves
 
-	log.Printf("StartDiscovery: starting with redis master: %s\n", d.masterHostPort)
+	// we setup the master queue only
+	d.masterSignature = hash(d.masterHostPort)
+	for i := 0; i < conPerEndpoint; i++ {
+		d.masterCh <- NewConnWrapper(d.masterHostPort, d.masterSignature)
+	}
+	// no slaves to start with
+	d.slavesSignature = ""
+
+	log.Printf("StartDiscovery: starting with redis master: %s and no slaves\n", d.masterHostPort)
 
 	// first synchronous update
 	d.updateSentinels()

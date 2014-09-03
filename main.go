@@ -1,6 +1,7 @@
 package main
 
 import (
+	"hargo/discovery"
 	"hargo/session"
 	"log"
 	"net"
@@ -12,6 +13,11 @@ import (
 func main() {
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	// plumbing
+	discovery := discovery.NewDiscovery()
+	cache := session.NewCache()
+	manager := session.NewManager(discovery, cache)
 
 	// we start a tcp server on port 36379
 	ln, err := net.Listen("tcp", ":36379")
@@ -26,7 +32,7 @@ func main() {
 			continue
 		}
 		go func(conn net.Conn) {
-			session.NewCommandSession(conn).Handle()
+			manager.NewCommandSession(conn).Handle()
 		}(conn)
 	}
 }

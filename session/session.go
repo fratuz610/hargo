@@ -9,31 +9,8 @@ import (
 	"time"
 )
 
-var slaveSafeCommandMap map[string]bool
-
-var discov *discovery.Discovery
-var cache *Cache
-
-func init() {
-
-	slaveSafeCommandMap = map[string]bool{
-		"get":      true,
-		"lrange":   true,
-		"smembers": true,
-		"hgetall":  true,
-	}
-
-	// we create the discovery object
-	discov = discovery.NewDiscovery()
-	cache = NewCache()
-
-}
-
-func NewCommandSession(client net.Conn) *CommandSession {
-	return &CommandSession{client: client, isHA: true, readBuf: make([]byte, 4096)}
-}
-
 type CommandSession struct {
+	manager *Manager
 	client  net.Conn
 	isHA    bool
 	readBuf []byte
@@ -69,6 +46,11 @@ func (c *CommandSession) Handle() {
 			c.isHA = true
 		}
 
+		// if we have no slaves all requests go to the master
+		if c.manager.discov.SlavesSignature() == "" {
+			c.isHA = true
+		}
+
 		c.sendAndReceive(c.readBuf[0:read])
 	}
 }
@@ -78,7 +60,7 @@ func (c *CommandSession) sendAndReceive(src []byte) {
 	var redis *discovery.ConnWrapper
 	var command string = string(src) // requests are generally very small
 
-	if bufferedResp := cache.Get(command); bufferedResp != nil {
+	if bufferedResp := c.manager.cache.Get(command); bufferedResp != nil {
 
 		//log.Printf("Serving cache reply for '%s'\n", command)
 
@@ -106,16 +88,16 @@ func (c *CommandSession) sendAndReceive(src []byte) {
 	}
 
 	if c.isHA {
-		redis = discov.GetMaster()
+		redis = c.manager.discov.GetMaster()
 	} else {
-		redis = discov.GetSlave()
+		redis = c.manager.discov.GetSlave()
 	}
 
 	defer func(redis *discovery.ConnWrapper) {
 		if c.isHA {
-			discov.ReturnMaster(redis)
+			c.manager.discov.ReturnMaster(redis)
 		} else {
-			discov.ReturnSlave(redis)
+			c.manager.discov.ReturnSlave(redis)
 		}
 	}(redis)
 
@@ -183,7 +165,6 @@ func (c *CommandSession) sendAndReceive(src []byte) {
 
 		// the message was served complete (no need to read again)
 		if cnt == 0 {
-
 			break
 		} else {
 			log.Printf("Partial reply: cnt %d => '%s'", cnt, string(c.readBuf[0:read]))
@@ -192,7 +173,7 @@ func (c *CommandSession) sendAndReceive(src []byte) {
 
 	// we cache the reply if it's not HA
 	if !c.isHA {
-		cache.Put(command, respBuffer.Bytes())
+		c.manager.cache.Put(command, respBuffer.Bytes())
 	}
 }
 
